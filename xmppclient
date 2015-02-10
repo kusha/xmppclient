@@ -1,0 +1,690 @@
+#!/usr/bin/env python3
+"""
+XMPP/Jabber client with CLI and GUI.
+
+Uses PLAIN auithorization method.
+Use at your own risks. Implements basics
+registration and authorization method.
+Can send and recieve messages. Also it's
+possible to work with roster.
+"""
+
+__author__ = "Mark Birger"
+__license__ = "MIT"
+__version__ = "0.1"
+__maintainer__ = "Mark Birger"
+__email__ = "xbirge00@stud.fit.vutbr.cz"
+__status__ = "Development"
+__date__ = "8 October 2014"
+
+import argparse, socket, base64, re, time, multiprocessing
+try:
+    from tkinter import *                    
+except ImportError:
+    TK_AVAILABLE = False
+else:
+    TK_AVAILABLE = True
+
+class Configuration:
+    """
+    Class, which creates object of argument parser. 
+    Validates input data. Setups Client class object.
+    Class needed for extra static methods.
+    """
+    def __init__(self):
+        self.parser = argparse.ArgumentParser(
+            description=__doc__,
+            epilog=__author__+" "+__date__)
+        self.parser.add_argument(
+            '--version',
+            action='version',
+            version='%(prog)s '+__version__)
+        self.parser.add_argument(
+            '-s',
+            '--server', 
+            action='store', 
+            nargs=1, 
+            type=self.validate_server, 
+            required=False, 
+            help='specifis XMPP server address', 
+            metavar='server_name:port',
+            dest='server')
+        self.parser.add_argument(
+            '-r',
+            '--register-user',
+            action='store',
+            nargs=1, 
+            type=self.validate_auth, 
+            required=False, 
+            help='register new user', 
+            metavar='username:password',
+            dest='register')
+        self.parser.add_argument(
+            '-l',
+            '--log-user',
+            action='store',
+            nargs=1, 
+            type=self.validate_auth, 
+            required=False, 
+            help='login as a user', 
+            metavar='username:password',
+            dest='login')
+        self.parser.add_argument(
+            '-c',
+            '--show-contactlist',
+            action='store_true',
+            required=False, 
+            help='show user contact list',
+            dest='contacts')
+        self.parser.add_argument(
+            '-a',
+            '--add-user',
+            action='store',
+            nargs=1, 
+            type=str, 
+            required=False, 
+            help='adds user to contact list', 
+            metavar='JID',
+            dest='add')
+        self.parser.add_argument(
+            '-m',
+            '--message',
+            action='store',
+            nargs=1, 
+            type=str, 
+            required=False, 
+            help='specify message text', 
+            metavar='message',
+            dest='message')
+        self.parser.add_argument(
+            '-u',
+            '--user',
+            action='store',
+            nargs=1, 
+            type=str, 
+            required=False, 
+            help='specify JID of a recipient', 
+            metavar='JID',
+            dest='user')
+        self.parser.add_argument(
+            '-w',
+            '--wait',
+            action='store',
+            nargs=1, 
+            type=int, 
+            required=False, 
+            help='wait for response ss seconds before exit', 
+            metavar='ss',
+            dest='wait')
+        self.parser.add_argument(
+            '-i',
+            '--interactive',
+            action='store_true',
+            required=False, 
+            help='enables interactive mode',
+            dest='interactive')
+        self.parser.parse_args(namespace=self)
+
+    @staticmethod
+    def validate_server(string):
+        """
+        Method splits input server and port
+        for Client class configuration.
+        If port isn't defined deafaults to 5222.
+        """
+        server = string.split(':')
+        if len(server) == 1:
+            server.append(5222)
+        else:
+            server[1] = int(server[1])
+        return server
+
+    @staticmethod
+    def validate_auth(string):
+        """
+        Method splits user and password
+        input string. Login can't containt
+        ':' symbol, so split to first.
+        Default password is empty.
+        """
+        data = string.split(':', 1)
+        if len(data) == 1:
+            data.append("")
+        return data
+
+class Client:
+    """
+    XMPP client class. Implements most of features.
+    Full description in help and documentation.
+    """
+    def __init__(self, config):
+        """
+        Defines all client class behavior.
+        Parses configuration object to define methods parameters.
+        """
+        self.log = open('log.txt', 'w')
+        print('<!-- Logging started. -->', file=self.log)
+        self.errors = open('error_log.txt', 'w')
+        print('Logging started.', file=self.errors)
+        # print(config.__dict__)
+        self.mid = 0 # XMPP message iq id
+        if config.server is not None:
+            self.server = config.server[0][0]
+            self.port = config.server[0][1]
+            self.socket = None
+            if self.connect():
+                self.loggedin = False
+                self.jid = None
+                if config.register is not None:
+                    self.user = config.register[0][0]
+                    self.password = config.register[0][1]
+                    if self.register() and config.login is None:
+                        self.auth()
+                if config.login is not None:
+                    self.user = config.login[0][0]
+                    self.password = config.login[0][1]
+                    self.auth()
+                if self.loggedin:
+                    if config.contacts != False:
+                        self.roster()
+                    if config.add is not None:
+                        user = config.add[0]
+                        self.add(user)
+                    if config.message is not None and config.user is not None:
+                        self.message(config.user[0], config.message[0])
+                    elif config.message is not None and config.user is None:
+                        print("User is not specified.", file=self.errors)
+                        print("Please specify target user.")
+                    if config.interactive == False and config.wait is not None:
+                        if config.wait[0] <= 0:
+                            print("Make sure, that waittime is under zero.")
+                        self.wait(config.wait[0])
+                    elif config.interactive == True and config.wait is None:
+                        if config.user is not None:
+                            if TK_AVAILABLE:
+                                self.interactive(config.user[0])
+                            else:
+                                print("Please install python3-tk package \
+                                    with apt-get.")
+                        else:
+                            print("User is not specified.", file=self.errors)
+                            print("Please specify target user.")
+                    elif config.interactive == True and config.wait is not None:
+                        print("Wrong options.", file=self.errors)
+                        print("User interactive mode OR wait before exit.")
+                self.exit()
+        else:
+            if config.register is None and \
+                config.login is None and \
+                config.contacts == False and \
+                config.add is None and \
+                config.message is None and \
+                config.user is None and \
+                config.wait is None and \
+                config.interactive == False:
+                print("Nothing to do.")
+            else:
+                print("Server is not specified.", file=self.errors)
+                print("Please specify a server.")
+
+    def connect(self):
+        """
+        Creates socket and connects to selected server and port.
+        """
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        print(
+            "Connecting to %s at port %i... "%(self.server, self.port),
+            end="")
+        try:
+            self.socket.connect((self.server, self.port))
+        except socket.error as exception:
+            print("Can't connect to server.\n%s"%(exception), file=self.errors)
+            print("failed")
+            return False
+        print("connected")
+        return True
+
+    def send(self, data):
+        """
+        Method send data to server.
+        Socket should be connected to server before.
+        """
+        total = 0
+        while total < len(data):
+            sent = self.socket.send(data[total:])
+            if sent == 0:
+                print("Can't send to socket.", file=self.errors)
+            total = total + sent
+            print(data.decode('utf-8'), file=self.log)
+
+    def recieve(self, pattern, timeout=5):
+        """
+        Method recieves data from socket and detects needed data.
+        If patter is False, uses <iq> id to detect needed message.
+        Else looking for pattern string, for exaple closing tag.
+        Returns data in any case.
+        """
+        self.socket.settimeout(timeout)
+        data = b''
+        start = time.time()
+        try:
+            while True:
+                chunk = self.socket.recv(2048)
+                if len(chunk) == 0:
+                    print(data.decode('utf-8'), file=self.log)
+                    return str(data)
+                else:
+                    data += chunk
+                    if isinstance(pattern, bool):
+                        if 'id="'+str(self.mid)+'"' in str(data):
+                            print(data.decode('utf-8'), file=self.log)
+                            return str(data)
+                    else:   
+                        if pattern in str(data):
+                            print(data.decode('utf-8'), file=self.log)
+                            return str(data)
+                    if (time.time() - start) > timeout:
+                        print(data.decode('utf-8'), file=self.log)
+                        return str(data)
+        except socket.timeout:
+            print(data.decode('utf-8'), file=self.log)
+            return str(data)
+
+    def new_id(self):
+        """
+        Method generates new identifier for <iq> stanza.
+        """
+        self.mid += 1
+        return str(self.mid)
+
+    def greet(self):
+        """
+        Send and recives greeting XMPP messages.
+        Includes XML and stream.
+        """
+        message = """
+        <?xml version="1.0"?>
+        <stream:stream xmlns:stream="http://etherx.jabber.org/streams" 
+        version="1.0" xmlns="jabber:client" to="%s">
+        """ % (self.server)
+        self.send(message.encode("utf-8"))
+        return self.recieve("</stream:features>")
+
+    def register(self):
+        """
+        Registers new user at XMPP server.
+        """
+        response = self.greet()
+        if not 'register' in response:
+            msg = "Registration is not available at the server."
+            print(msg, file=self.errors)
+            print(msg)
+            return False
+        print(
+            "Registering %s with password %s... " % (self.user, self.password),
+            end="")
+        message = """
+        <iq xmlns="jabber:client" type="get" to="%s">
+        <query xmlns="jabber:iq:register"/>
+        </iq>
+        """ % (self.server)
+        self.send(message.encode("utf-8"))
+        if not '<iq type="result"' in self.recieve(""):
+            print("problems with registration", file=self.errors)
+            print("failed")
+            return False
+        message = """
+        <iq xmlns="jabber:client" type="set" to="%s">
+        <query xmlns="jabber:iq:register">
+        <x xmlns="jabber:x:data" type="form">
+        <field type="hidden" var="FORM_TYPE">
+        <value>jabber:iq:register</value>
+        </field>
+        <field type="text-single" var="username">
+        <value>%s</value>
+        </field>
+        <field type="text-private" var="password">
+        <value>%s</value>
+        </field>
+        </x>
+        </query>
+        </iq>
+        """ % (self.server, self.user, self.password)
+        self.send(message.encode("utf-8"))
+        response = self.recieve("</iq>")
+        if '<iq type="result"' in response:
+            print('registered')
+            return True
+        else:
+            print("Registration failed.", file=self.errors)
+            print('failed')
+            return False
+
+    def auth(self):
+        """
+        Method implements PLAIN authorization at the server.
+        """
+        self.greet()
+        print(
+            "Logging in as %s with password %s... " % \
+                (self.user, self.password),
+            end="")
+        key = b'\x00'+self.user.encode("utf-8")
+        key += b'\x00'+self.password.encode("utf-8")
+        key = base64.b64encode(key)
+        message = """
+        <auth xmlns="urn:ietf:params:xml:ns:xmpp-sasl" mechanism="PLAIN">%s</auth>
+        """ % (key.decode("utf-8"))
+        self.send(message.encode("utf-8"))
+        response = self.recieve("urn:ietf:params:xml:ns:xmpp-sasl")
+        if "success" in response:
+            print("success")
+            self.bind_session()
+            self.loggedin = True
+            return True
+        else:
+            print("Authorization failed.", file=self.errors)
+            print("failed")
+        
+    def bind_session(self):
+        """
+        This method called after successfull authorization.
+        Uses bind and session of XMPP protocol.
+        """
+        message = """
+        <stream:stream xmlns="jabber:client" 
+        to="%s" 
+        version="1.0" 
+        xmlns:stream="http://etherx.jabber.org/streams" >
+        """ % (self.server)
+        self.send(message.encode("utf-8"))
+        self.recieve("</stream:features>")
+        message = """
+        <iq type="set" id="%s"><bind xmlns="urn:ietf:params:xml:ns:xmpp-bind"> 
+        <resource>xmppclient</resource></bind></iq>
+        """%(self.new_id())
+        self.send(message.encode("utf-8"))
+        response = self.recieve(False)
+        try:
+            self.jid = re.search(r"<jid>(.*)</jid>", response).group(1)
+            print("Got a JID: %s" % (self.jid))
+        except AttributeError:
+            msg = "Failed JID recognition."
+            print(msg, file=self.errors)
+            print(msg)
+        message = """
+        <iq type="set" id="%s"> 
+        <session xmlns="urn:ietf:params:xml:ns:xmpp-session" /></iq>
+        """%(self.new_id())
+        self.send(message.encode("utf-8"))
+        response = self.recieve(False)
+        self.presence()
+
+    def presence(self):
+        """
+        Send presence report to the server.
+        Needed to start recieve messages.
+        """
+        message = """
+        <presence xmlns="jabber:client"></presence>
+        """
+        self.send(message.encode("utf-8"))
+
+    def roster(self):
+        """
+        Requests and recives roster (XMPP contact list).
+        """
+        print("Loading contacts list... ", end="")
+        message = """
+        <iq type="get" id="%s">
+        <query xmlns="jabber:iq:roster"/> 
+        </iq> 
+        """%(self.new_id())
+        self.send(message.encode("utf-8"))
+        response = self.recieve(False)
+        contacts = re.findall(r'<item.*?jid="(.*?)".*?\/>', response)
+        if len(contacts) == 0:
+            print("empty")
+        else:
+            print("loaded:")
+            for contact in contacts:
+                print('\t'+contact)
+
+    def add(self, user):
+        """
+        Method adds user by JID in variable user to roster.
+        """
+        print("Adding %s to your contact list... " % (user), end="")
+        message = """
+        <iq xmlns="jabber:client" type="set"  id="%s">
+        <query xmlns="jabber:iq:roster">
+        <item jid="%s"/>
+        </query></iq>
+        """%(self.new_id(), user)
+        self.send(message.encode("utf-8"))
+        response = self.recieve(False)
+        if 'type="result"' in response and \
+            not 'type="error"' in response:
+            print("added")
+        else:
+            print("Failed to add user to contacts.", file=self.errors)
+            print("failed")
+
+    def message(self, user, message):
+        """
+        Method send message to specified user.
+        """
+        print("Sending message to %s... "%(user), end="")
+        message = """
+        <message to="%s" from="%s" type="chat" id="%s">  
+        <body>%s</body></message>
+        """%(user, self.jid, self.new_id(), message)
+        self.send(message.encode("utf-8"))
+        print("sent")
+
+    def wait(self, wait):
+        """
+        Method implements waiting for incoming message.
+        Uses self.incoming method called in another process.
+        """
+        print("Waiting for a message... ", end="")
+        incoming_queue = multiprocessing.Queue(maxsize=0)
+        log_queue = multiprocessing.Queue(maxsize=0)
+        incoming_process = multiprocessing.Process(
+            target=self.incoming,
+            args=(incoming_queue, log_queue, ))
+        incoming_process.start()
+        start = time.time()
+        while True:
+            if not log_queue.empty():
+                response = log_queue.get()
+                print(response.decode('utf-8'), file=self.log)
+                continue
+            if not incoming_queue.empty():
+                response = incoming_queue.get()
+                print("recieved")
+                msg_from, msg_body = self.parse_message(response)
+                print(self.print_message(time.localtime(), msg_from, msg_body))
+                break
+            if time.time() - start > wait:
+                print("timeouted")
+                break
+        incoming_process.terminate()
+
+    def parse_message(self, response):
+        """
+        Method parses incoming XML data, and returns
+        parsed message target and message body.
+        """
+        response = str(response)
+        response = re.search(r'<message.*?<\/message>', response).group(0)
+        msg_to = re.search(r'to="(.*?)"', response).group(1)
+        if msg_to != self.jid:
+            print("Wrong message destination.", file=self.errors)
+        msg_from = re.search(r'from="(.*?)"', response).group(1)
+        msg_body = re.search(r'<body>(.*?)<\/body>', response).group(1)
+        return msg_from, msg_body
+
+    @staticmethod
+    def print_message(localtime, msg_from, message):
+        """
+        Method creates string, which contains message info.
+        Used in wait and interactive methods.
+        """
+        msg_from = re.search(r'(.*?)@', msg_from).group(1)
+        return "[%s] <%s> %s" % \
+            (time.strftime("%H:%M:%S", localtime), msg_from, message)
+
+    def incoming(self, incoming_queue, log_queue):
+        """
+        Method recieves data from socket and sends it to the Queue.
+        Another queue needed to log data, send to this queue for
+        example presence tags too.
+        Works in another process.
+        """
+        self.socket.settimeout(None)
+        data = b''
+        try:
+            while True:
+                chunk = self.socket.recv(2048)
+                log_queue.put(chunk)
+                data += chunk
+                if "error" in str(data):
+                    pass
+                elif "</message>" in str(data):
+                    # print(data.decode('utf-8'), file=self.log)
+                    incoming_queue.put(data)
+                    data = b''
+                if "urn:xmpp:ping" in str(data):
+                    # print(data.decode('utf-8'), file=self.log)
+                    mid = re.search(r'id="(.*?)"', str(data)).group(1)
+                    message = """
+                    <iq id="%s" type="result">
+                    <ping xmlns='urn:xmpp:ping'/></iq>
+                    """%(mid) 
+                    self.send(message.encode("utf-8"))
+        except socket.timeout:
+            message = """
+            <iq id="%s" type="get">
+            <ping xmlns='urn:xmpp:ping'/></iq>
+            """%(self.new_id()) 
+            self.send(message.encode("utf-8"))
+            print("Updating socket")
+
+    def interactive(self, user):
+        """
+        Method implements GUI. Uses incoming method in another process.
+        Allows user to send and recieve messages.
+        """
+
+        incoming_queue = multiprocessing.Queue(maxsize=0)
+        log_queue = multiprocessing.Queue(maxsize=0)
+        incoming_process = multiprocessing.Process(
+            target=self.incoming,
+            args=(incoming_queue, log_queue, ))
+        incoming_process.start()
+
+        def interactive_send(event):
+            """
+            This is callback function for clicking Send button.
+            Uses socket in the same process. Send message to server.
+            """
+            typed = field.get()
+            if typed == "":
+                return
+            field.delete(0, END)
+            message = """
+            <message to="%s" from="%s" type="chat" id="%s">  
+            <body>%s</body></message>
+            """%(user, self.jid, self.new_id(), typed)
+            self.send(message.encode("utf-8"))
+            log.configure(state=NORMAL)
+            log.insert(
+                INSERT,
+                self.print_message(time.localtime(), self.jid, typed)+'\n')
+            log.configure(state=DISABLED)
+
+        root = Tk()
+
+        def update():
+            """
+            This function check queues for new meessages.
+            Updates GUI if new message available.
+            Sheduled by GUI.
+            """
+            if not log_queue.empty():
+                while not log_queue.empty():
+                    response = log_queue.get()
+                    print(response.decode('utf-8'), file=self.log)
+            if not incoming_queue.empty():
+                income = incoming_queue.get()
+                msg_from, msg_body = self.parse_message(income)
+                log.configure(state=NORMAL)
+                log.insert(
+                    INSERT,
+                    self.print_message(
+                        time.localtime(),
+                        msg_from,
+                        msg_body)+'\n')
+                log.configure(state=DISABLED)
+            root.after(100, update)
+        
+        root.wm_title("xmppclient - %s"%(self.jid))
+        root.geometry('{}x{}'.format(600, 400))
+        frame_top = Frame(root, heigh=40, bd=0, bg='#f9f9f9', relief=SOLID)
+        frame_center = Frame(root, background='#e5e5e5', borderwidth=1)
+        frame_bottom = Frame(root, heigh=40, bd=0, bg='#f9f9f9', relief=FLAT)
+
+        scrollbar = Scrollbar(frame_center)
+        scrollbar.pack(side=RIGHT, fill=Y)
+
+        label = Label(
+            frame_top,
+            text="Chat with: %s"%(user),
+            bg='#f9f9f9')
+        log = Text(frame_center, width=60, height=20, state=DISABLED)
+        log.config(yscrollcommand=scrollbar.set)
+        field = Entry(frame_bottom, width=50)
+        btn = Button(
+            frame_bottom,
+            text="Send",
+            width=10,
+            height=5,
+            highlightbackground='#f9f9f9')
+
+        btn.bind("<Button-1>", interactive_send)
+        field.bind("<Return>", interactive_send)
+
+        frame_top.pack(fill=X, expand=False)
+        frame_center.pack(fill=BOTH, expand=True)
+        frame_bottom.pack(fill=X, expand=False)
+
+        label.pack(fill=X, side=LEFT, padx=5, pady=5)
+        log.pack(fill=BOTH, expand=True)
+        field.pack(fill=X, side=LEFT, expand=True, padx=5, pady=5)
+        btn.pack(fill=X, side=RIGHT, padx=5, pady=5)
+
+        root.update()
+        root.minsize(root.winfo_width(), root.winfo_height())
+
+        root.after(100, update)
+        root.mainloop()
+
+        incoming_process.terminate()
+
+    def exit(self):
+        """
+        Send end of stream message. Closes socket.
+        """
+        print("Closing connection... ", end="")
+        message = """
+        </stream:stream>
+        """
+        self.send(message.encode("utf-8"))
+        self.socket.shutdown(socket.SHUT_RDWR)
+        self.socket.close()
+        print("closed")
+        
+if __name__ == "__main__":
+    CONFIG = Configuration()
+    CLIENT = Client(CONFIG)
